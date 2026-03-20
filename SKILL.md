@@ -18,72 +18,125 @@ GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:eriic
 # Use GitHub web UI or API to create first, then clone
 ```
 
-## Directory Structure
+## ⚠️ 重要：Gitlink 问题
 
+**问题描述：**
+如果直接 `cp -r` 复制一个包含 `.git` 目录的仓库，会创建 **git submodule/gitlink**，导致文件内容为空。
+
+**错误示例：**
+```bash
+# ❌ 错误！会创建 gitlink（submodule）
+cp -r /root/.openclaw/workspace openclaw-yii/
+
+# git ls-tree 会显示类似：
+# 160000 commit xxx  workspace   # 这是 gitlink，内容为空！
 ```
-openclaw-yii/
-├── .gitignore          # Excludes sensitive/large dirs
-├── age.key            # Private key (NEVER upload to GitHub!)
-├── credentials/        # Encrypted backup
-├── workspace/          # Workspace files
-├── memory/            # Memory docs (excludes lancedb-pro)
-├── agents/            # Agent configs
-└── cron/              # Cron configs
+
+**正确做法：**
+```bash
+# ✅ 正确：先删除 .git，再复制
+cd /root/.openclaw/openclaw-yii
+rm -rf workspace
+mkdir workspace
+cp -r /root/.openclaw/workspace/* workspace/
+
+# 或者用 rsync 排除 .git
+rsync -a --exclude='.git' /root/.openclaw/workspace/ workspace/
 ```
 
 ## .gitignore Content
 
 ```gitignore
-# Large/dynamic directories
+# ============================================
+# OpenClaw 备份排除规则
+# ============================================
+
+# --- 大型/动态增长目录 ---
 extensions/
 completions/
 logs/
 delivery-queue/
 canvas/
 
-# Sensitive directories
-credentials/
-identity/
-devices/
+# --- 敏感目录（必须排除！）---
+credentials/      # 密钥（加密后上传 .age 即可）
+identity/        # 设备身份
+devices/         # 设备配置
 
-# Backup files
+# --- Git 相关（禁止上传！）---
+.git
+.ssh
+.openclaw
+
+# --- 备份文件 ---
 *.bak
 *.bak.*
 
-# Encrypted data (keep this one commented to allow .age files)
-# *.age
+# --- 加密文件 ---
+age.key          # 私钥，绝对不能上传！
+*.age            # 加密文件可以上传
 
-# Temporary files
+# --- 临时文件 ---
 tmp/
 *.tmp
 
-# Large databases (local vector DB)
+# --- 大型数据库 ---
 memory/lancedb-pro/
+
+# --- 其他 ---
+subagents/
 ```
 
 ## Backup Workflow
 
-### 1. Encrypt and Backup credentials
+### 1. 同步工作区文件（避免 gitlink）
 
 ```bash
 cd /root/.openclaw/openclaw-yii
 
-# Re-encrypt credentials (if key changed)
-tar -czvf credentials.tar.gz ../credentials/
+# 同步 workspace（排除 .git 等敏感文件）
+rsync -a --exclude='.git' --exclude='.ssh' --exclude='.openclaw' \
+      --exclude='.clawhub' --exclude='.learnings' \
+      /root/.openclaw/workspace/ workspace/
+
+# 同步 agents/
+rsync -a --exclude='.git' /root/.openclaw/agents/ agents/
+
+# 同步 cron/
+rsync -a /root/.openclaw/cron/ cron/
+
+# 同步 memory/（排除 lancedb-pro）
+rsync -a --exclude='lancedb-pro' /root/.openclaw/memory/ memory/
+```
+
+### 2. 加密 credentials
+
+```bash
+cd /root/.openclaw/openclaw-yii
+
+# 加密 credentials
+tar -czvf credentials.tar.gz -C /root/.openclaw credentials/
 age -r <PUBLIC_KEY> -o credentials.tar.gz.age credentials.tar.gz
 rm credentials.tar.gz
+```
 
-# Commit all changes
+### 3. 提交并推送
+
+```bash
 git add -A
+git status  # 先检查是否有敏感文件
 git commit -m "backup: $(date '+%Y-%m-%d %H:%M')"
 git push
 ```
 
-### 2. Update .gitignore (if needed)
+### 4. 验证备份
 
 ```bash
-# Add new sensitive dirs to exclude
-echo "memory/lancedb-pro/" >> .gitignore
+# 检查 gitlink
+git ls-tree -r HEAD --name-only | grep "^160000" && echo "有 gitlink 问题！" || echo "正常"
+
+# 检查文件数量
+git ls-tree -r HEAD --name-only | wc -l
 ```
 
 ## Restore Workflow
@@ -95,7 +148,14 @@ cd /root/.openclaw
 GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git clone git@github.com:eriic828/openclaw-yii.git
 ```
 
-### 2. Decrypt credentials
+### 2. 验证无 gitlink
+
+```bash
+cd openclaw-yii
+git ls-tree -r HEAD --name-only | grep "^160000" && echo "有问题！" || echo "正常"
+```
+
+### 3. Decrypt credentials
 
 ```bash
 cd /root/.openclaw/openclaw-yii
@@ -106,7 +166,7 @@ tar -xzvf credentials.tar.gz
 rm credentials.tar.gz
 
 # Move back to .openclaw
-mv credentials/ ../credentials/
+mv credentials/ /root/.openclaw/
 ```
 
 ## AGE Encryption
@@ -144,31 +204,63 @@ Set up periodic backup:
 # Create backup script
 cat > /root/.openclaw/openclaw-yii/backup.sh << 'EOF'
 #!/bin/bash
-cd /root/.openclaw/openclaw-yii
+set -e
 
-# Update credentials backup
-tar -czvf credentials.tar.gz ../credentials/
-age -r <PUBLIC_KEY> -o credentials.tar.gz.age credentials.tar.gz
-rm credentials.tar.gz
+REPO_DIR="/root/.openclaw/openclaw-yii"
+PUBLIC_KEY="age1zgxmzt2edpl74l0haxtdcsga9ug4n6zhj2elqcy3pe8n9ljauq6s3sfamk"
+OPENCLAW_DIR="/root/.openclaw"
+
+cd "$REPO_DIR"
+
+# Sync files (rsync to avoid gitlink)
+rsync -a --exclude='.git' --exclude='.ssh' --exclude='.openclaw' \
+      --exclude='.clawhub' --exclude='.learnings' \
+      "$OPENCLAW_DIR/workspace/" workspace/
+
+rsync -a --exclude='.git' "$OPENCLAW_DIR/agents/" agents/
+rsync -a --exclude='lancedb-pro' "$OPENCLAW_DIR/memory/" memory/
+rsync -a "$OPENCLAW_DIR/cron/" cron/
+
+# Encrypt credentials
+if [ -d "$OPENCLAW_DIR/credentials" ]; then
+    tar -czvf credentials.tar.gz -C "$OPENCLAW_DIR" credentials/
+    age -r "$PUBLIC_KEY" -o credentials.tar.gz.age credentials.tar.gz
+    rm credentials.tar.gz
+fi
 
 # Commit and push
 git add -A
 git commit -m "backup: $(date '+%Y-%m-%d %H:%M')"
 git push
+
+echo "Backup completed at $(date)"
 EOF
 
 chmod +x /root/.openclaw/openclaw-yii/backup.sh
 
 # Add to crontab (daily at 23:00)
-echo "0 23 * * * /root/.openclaw/openclaw-yii/backup.sh" | crontab -
+echo "0 23 * * * /root/.openclaw/openclaw-yii/backup.sh >> /tmp/backup.log 2>&1" | crontab -
 ```
 
 ## Important Notes
 
-1. **Private key `age.key` must be saved separately** - Store in local password manager
-2. **Always keep local repo** - Don't delete after push, use for future syncs
-3. **Exclude large dirs** - extensions/ (239MB), lancedb-pro/ are too big
-4. **Test decryption** - After backup, verify restore works
+1. **Private key `age.key` must be saved separately** - Store in local password manager, NEVER upload to GitHub
+
+2. **Use rsync instead of cp -r** - To avoid creating gitlinks/submodules
+
+3. **Always verify before push** - Check `git status` and `git ls-tree` for issues
+
+4. **Exclude sensitive directories:**
+   - `.git` - Git 仓库目录
+   - `.ssh` - SSH 密钥
+   - `.openclaw` - OpenClaw 配置
+   - `credentials/` - 密钥（加密后上传 .age）
+   - `identity/` - 设备身份
+   - `devices/` - 设备配置
+
+5. **Test decryption after backup** - Verify restore works
+
+6. **Keep local repo** - Don't delete after push, use for future syncs
 
 ## Current Config
 
